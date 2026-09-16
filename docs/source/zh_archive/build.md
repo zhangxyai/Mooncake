@@ -132,6 +132,14 @@
     make -j
     ```
 
+    若还需启用基于 CNCL 集合通信库的 `cncl_transport`（要求 Neuware 中的 CNCL 1.30+），在上面的基础上加 `-DUSE_CNCL=ON`（该选项会自动启用 `USE_MLU`）：
+    ```bash
+    cmake .. -DUSE_CNCL=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
+    make -j
+    ```
+
+    CNCL 传输基于双边 `cnclSend`/`cnclRecv`（CNCL 1.30 没有单边读操作），因此只支持 WRITE 请求，且必须是 `TransferEngine` 实例中唯一安装的传输。详见英文文档 `getting_started/build.md` 与 `getting_started/supported-protocols.md`。
+
 5. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_ROOT`（优先取 `MACA_HOME` 环境变量，未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`，建议在环境变量中同时加入两者，避免链接或运行时找不到共享库：
     ```bash
     export MACA_HOME=/opt/maca

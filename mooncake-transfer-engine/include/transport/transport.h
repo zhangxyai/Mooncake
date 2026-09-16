@@ -177,6 +177,10 @@ class Transport {
                 int device_id;
             } nccl;
             struct {
+                void *notifier;  // cnrtNotifier_t
+                int device_id;
+            } cncl;
+            struct {
                 uint64_t dest_addr;
             } tcp;
             struct {

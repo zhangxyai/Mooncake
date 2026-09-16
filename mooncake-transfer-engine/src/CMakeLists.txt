@@ -183,6 +183,10 @@ if(USE_MLU)
   target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
+if(USE_CNCL)
+  target_link_libraries(transfer_engine PUBLIC cncl)
+endif()
+
 if(USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
                                                MPI::MPI)

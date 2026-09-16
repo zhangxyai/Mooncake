@@ -351,6 +351,23 @@ export MC_INTRANODE_NVLINK=true
 - Default off because the path is not NUMA-aware
 - Mooncake Store segments are not shm-backed until a follow-up allocator change
 
+### CNCL Transport (cncl)
+
+**Description:** Cambricon MLU communication using CNCL (Cambricon Collective Communication Library). Because CNCL 1.30 exposes two-sided `cnclSend`/`cnclRecv` rather than one-sided RMA, this transport performs WRITEs by reserving a matching `cnclRecv` on the peer through the existing batch/RPC metadata channel, then issuing `cnclSend`.
+
+**Status:** Experimental. WRITE only — READ requests are rejected.
+
+**Use When:**
+- Transferring KV-cache between Cambricon MLU devices over MLU-Link
+- Intra-node where the RDMA transport is not desired
+
+**Requirements:**
+- Cambricon MLU hardware and Neuware SDK with CNCL 1.30+
+- Build with `-DUSE_CNCL=ON` (implies `-DUSE_MLU=ON`); see the CNCL row in [Build Options](build.md)
+- The `cncl` transport must be the only transport installed in the `TransferEngine` instance
+- Both endpoints of a session must live in separate processes: a CNCL clique id can be initialized only once per process
+
+
 ### Ascend Transport (ascend)
 
 **Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
@@ -536,7 +553,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
-| Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
+| Cambricon MLU Clusters | rdma (or cncl, WRITE only) | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol. For MLU-Link transfers, build with `-DUSE_CNCL=ON` and use `cncl` as the sole transport |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
 

@@ -35,6 +35,9 @@
 #ifdef USE_NCCL_HOST
 #include "transport/nccl_transport/nccl_transport.h"
 #endif
+#ifdef USE_CNCL
+#include "transport/cncl_transport/cncl_transport.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #endif
@@ -430,6 +433,14 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         return nullptr;
     }
 #endif
+#ifdef USE_CNCL
+    if ((proto == "cncl" && !transport_map_.empty()) ||
+        (proto != "cncl" && transport_map_.count("cncl") != 0)) {
+        LOG(ERROR) << "CNCL transport must be the only transport installed in "
+                      "a Transfer Engine instance";
+        return nullptr;
+    }
+#endif
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
         if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
@@ -467,6 +478,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_NCCL_HOST
     else if (std::string(proto) == "nccl") {
         transport = new NcclHostTransport();
+    }
+#endif
+#ifdef USE_CNCL
+    else if (std::string(proto) == "cncl") {
+        transport = new CnclTransport();
     }
 #endif
 #ifdef USE_ASCEND_DIRECT

@@ -36,6 +36,11 @@ if(USE_NCCL_HOST)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nccl_host_transport>)
 endif()
 
+if(USE_CNCL)
+  add_subdirectory(cncl_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:cncl_transport>)
+endif()
+
 if(USE_CXL)
   add_subdirectory(cxl_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)

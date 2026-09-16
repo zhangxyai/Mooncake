@@ -228,6 +228,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     bool use_flagcx = (proto == "flagcx");
+    // CNCL must be the only transport in the engine, so its installation
+    // cannot rely on auto-discover (which installs RDMA/TCP first).
+    bool use_cncl = (proto == "cncl");
 
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
@@ -254,7 +257,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+    engine_ = std::make_unique<TransferEngine>(!use_flagcx && !use_cncl,
+                                               device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -344,6 +348,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "FlagCX transport installed successfully";
+    } else if (use_cncl) {
+        LOG(INFO)
+            << "Installing CNCL transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("cncl", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install CNCL transport";
+            return -1;
+        }
+        LOG(INFO) << "CNCL transport installed successfully";
     }
 #endif
 
