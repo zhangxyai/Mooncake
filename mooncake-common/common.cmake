@@ -81,6 +81,7 @@ option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
        OFF)
 option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
+option(USE_CNCL "option for enabling the CNCL transport for Cambricon MLU" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
@@ -373,6 +374,14 @@ if(NOT DEFINED MACA_LIB_DIR OR MACA_LIB_DIR STREQUAL "")
   else()
     set(MACA_LIB_DIR "${MACA_ROOT}/lib")
   endif()
+endif()
+
+if(USE_CNCL)
+  # The CNCL transport is built on top of the MLU runtime (cnrt/cndrv), so
+  # enabling it requires the MLU support paths as well.
+  set(USE_MLU ON)
+  add_compile_definitions(USE_CNCL)
+  message(STATUS "CNCL transport for Cambricon MLU is enabled")
 endif()
 
 if(USE_MLU)

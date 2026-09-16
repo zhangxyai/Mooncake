@@ -121,6 +121,7 @@ environment setup must be prepared separately.
 | NVIDIA Multi-Node NVLink | `-DUSE_MNNVL=ON` | Requires CUDA. | Also set `-DUSE_CUDA=ON`. Not used with MUSA, HIP, or MACA builds. |
 | Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
 | Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
+| Cambricon CNCL (WRITE only) | `-DUSE_CNCL=ON` | Install Cambricon Neuware SDK with CNCL 1.30+. | Implies `-DUSE_MLU=ON`. Must be installed as the only transport in a `TransferEngine` instance, and both endpoints of a session must live in separate processes. Supports WRITE requests only because CNCL 1.30 has no one-sided read operation. |
 | MetaX MACA | `-DUSE_MACA=ON` | Install MACA SDK. | Set `MACA_HOME`, or pass `-DMACA_ROOT=/path/to/maca`. Use `-DMACA_INCLUDE_DIR`, `-DMACA_LIB_DIR`, and `-DMACA_RUNTIME_LIBS` for custom layouts. |
 | Huawei Ascend Direct | `-DUSE_ASCEND_DIRECT=ON` | Install Ascend CANN Toolkit and ADXL dependencies. | Source `/usr/local/Ascend/cann/set_env.sh` before configuring CMake. This is the recommended Ascend path. |
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
@@ -139,6 +140,21 @@ requires destroying and recreating the NCCL-only `TransferEngine` on both
 peers, then registering the buffers again. A one-sided restart is unsupported.
 Same-engine targets remain unsupported and should use
 the intra-node NVLink/P2P transport.
+```
+
+```{admonition} CNCL transport constraints
+:class: important
+The CNCL transport is built on CNCL's two-sided send/recv (CNCL 1.30 has no
+one-sided read), so it supports WRITE requests only and rejects READ requests
+with an unsupported-transport error. It must be the only transport installed in
+a `TransferEngine` instance. Both endpoints of a session must live in separate
+processes, because a CNCL clique id can be initialized only once per process.
+Each WRITE is matched by a receive operation that the peer daemon enqueues in
+response to a reservation request, so transfers complete in submission order
+per session. If a session reaches a terminal failure, it retains the error and
+subsequent transfers fail without retrying. Recovery requires destroying and
+recreating the CNCL-only `TransferEngine` on both peers, then registering the
+buffers again.
 ```
 
 ```{admonition} NCCL DeviceTransport version contract
@@ -238,6 +254,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_CNCL=ON/OFF` | `OFF` | Enable the experimental, WRITE-only CNCL transport for Cambricon MLU. Implies `-DUSE_MLU=ON` and requires Neuware with CNCL 1.30+. Must be installed as the engine's only transport, with each session endpoint in its own process. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |

@@ -171,3 +171,30 @@ if(USE_NCCL_HOST AND BUILD_NCCL_HOST_TRANSPORT_EXAMPLE)
   target_link_libraries(nccl_host_transport_example PRIVATE
     transfer_engine NCCL::nccl glog::glog gflags::gflags)
 endif()
+# CNCL transport example. Each endpoint must live in its own process (CNCL
+# forbids initializing one clique id twice per process), so the binary
+# re-executes itself as --rank 0/--rank 1 children sharing a workdir.
+option(BUILD_CNCL_TRANSPORT_EXAMPLE
+       "Build the two-process CNCL Transfer Engine example for MLU" OFF)
+if(USE_CNCL AND BUILD_CNCL_TRANSPORT_EXAMPLE)
+  add_executable(cncl_transport_example ${WORKSPACE}/cncl_transport_example.cpp)
+  target_include_directories(
+    cncl_transport_example
+    PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(cncl_transport_example
+                        PRIVATE transfer_engine cnrt glog::glog gflags::gflags)
+endif()
+
+# CNCL vs RDMA benchmark for MLU buffers. Same two-process harness for both
+# transports (CNCL requires separate-process endpoints), so the numbers are
+# directly comparable. The cncl mode additionally requires a USE_CNCL build.
+option(BUILD_MLU_TRANSPORT_BENCH
+       "Build the two-process CNCL/RDMA MLU transport benchmark" OFF)
+if(USE_MLU AND BUILD_MLU_TRANSPORT_BENCH)
+  add_executable(mlu_transport_bench ${WORKSPACE}/mlu_transport_bench.cpp)
+  target_include_directories(
+    mlu_transport_bench
+    PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(mlu_transport_bench PRIVATE transfer_engine cnrt
+                                                    glog::glog)
+endif()
