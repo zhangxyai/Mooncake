@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <iomanip>
@@ -40,6 +41,7 @@
 #include <vector>
 
 #include "common.h"
+#include "config.h"
 #include "error.h"
 #include "transfer_metadata.h"
 
@@ -178,22 +180,179 @@ std::string makeSessionKey(const std::string& local_name, int local_device,
     return out.str();
 }
 
-void destroyCnclSliceNotifier(Transport::Slice* slice) {
-    if (!slice || !slice->cncl.notifier) return;
+// Completion for the CNCL transport is tracked per submission group rather
+// than per descriptor. CNCL is two-sided: it has no shared completion ring, so
+// every descriptor in flight needs its own cnrtNotifier_t, and that object is
+// scarce on the device (cnrtNotifierCreate fails with
+// CN_OPS_ERROR_OUT_OF_RESOURCES once the pool is exhausted). A group is a run
+// of cnclSend calls issued on one session's queue, followed by a single
+// cnrtPlaceNotifier on that same queue. CNCL executes a queue in FIFO order,
+// so the tail notifier completes only after every send of the group has
+// completed: one notifier replaces one per descriptor, and the in-flight
+// notifier count is bounded by the number of concurrent groups instead of by
+// the number of descriptors.
+struct CnclCompletionGroup {
+    cnrtNotifier_t notifier = nullptr;
+    int device_id = -1;
+    int64_t start_nano = 0;
+    // Deadline for the group to resolve, so a stuck send fails the batch
+    // instead of hanging it. 0 disables the check.
+    int64_t deadline_nano = 0;
+    // Slices still referencing this group. The last one out deletes it.
+    std::atomic<int64_t> slice_refs{0};
+    // The notifier has been placed on the session queue.
+    std::atomic<bool> armed{false};
+    std::atomic<bool> resolved{false};
+    std::atomic<bool> failed{false};
+    std::atomic<bool> notifier_freed{false};
+    // Serializes notifier query and destroy, so each happens at most once.
+    std::mutex resolve_mutex;
+};
 
-    cnrtNotifier_t notifier =
-        reinterpret_cast<cnrtNotifier_t>(slice->cncl.notifier);
-    const int device_id = slice->cncl.device_id;
-    // Relinquish slice ownership before calling CNRT so all later cleanup
-    // paths are idempotent even when CNRT reports an error.
-    slice->cncl.notifier = nullptr;
-    slice->cncl.device_id = -1;
-
+void destroyNotifier(cnrtNotifier_t notifier, int device_id) {
     int saved_device = -1;
     cnrtGetDevice(&saved_device);
     if (device_id >= 0) cnrtSetDevice(device_id);
-    cnrtNotifierDestroy(notifier);
+    cnrtRet_t result = cnrtNotifierDestroy(notifier);
     if (saved_device >= 0) cnrtSetDevice(saved_device);
+    if (result != cnrtSuccess) {
+        cnrtGetLastError();
+        LOG(ERROR) << "[CNCL] cnrtNotifierDestroy failed device=" << device_id
+                   << ": " << cnrtGetErrorStr(result);
+    }
+}
+
+// Releases the group's notifier exactly once, whichever gets there first: the
+// poller that resolves the group, or the slice-cache cleanup of the last slice
+// still holding a reference.
+void freeGroupNotifier(CnclCompletionGroup* group) {
+    if (!group) return;
+    std::lock_guard<std::mutex> lock(group->resolve_mutex);
+    if (group->notifier_freed.exchange(true)) return;
+    cnrtNotifier_t notifier = group->notifier;
+    group->notifier = nullptr;
+    if (!notifier) return;
+    destroyNotifier(notifier, group->device_id);
+}
+
+// Slice cleanup callback. Every slice of a group holds one reference; the
+// group object is freed by whichever slice is released last.
+void releaseCnclSliceResources(Transport::Slice* slice) {
+    if (!slice) return;
+    auto* group = static_cast<CnclCompletionGroup*>(slice->cncl.group);
+    slice->cncl.group = nullptr;
+    slice->cncl.device_id = -1;
+    if (!group) return;
+    if (group->slice_refs.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    // Reachable when the batch is torn down before the group resolved. A
+    // resolved group has already returned its notifier to the device.
+    freeGroupNotifier(group);
+    delete group;
+}
+
+// Bounded retry around cnrtNotifierCreate. The device notifier pool is shared
+// by every context in the process, so a burst of concurrent groups can
+// exhaust it; retrying gives already-resolved groups time to return their
+// notifiers instead of failing the submission outright. The budget also bounds
+// the cost of a genuinely stuck pool, after which the group fails cleanly
+// rather than hanging.
+cnrtRet_t createNotifierWithRetry(int device_id, cnrtNotifier_t* notifier) {
+    constexpr int64_t kRetryBudgetNano = 1000LL * 1000 * 1000;
+    constexpr int64_t kMaxBackoffNano = 64LL * 1000 * 1000;
+    const int64_t deadline_nano = getCurrentTimeInNano() + kRetryBudgetNano;
+    int64_t backoff_nano = 1000 * 1000;
+    for (;;) {
+        int saved_device = -1;
+        cnrtGetDevice(&saved_device);
+        cnrtSetDevice(device_id);
+        cnrtRet_t result = cnrtNotifierCreate(notifier);
+        if (saved_device >= 0) cnrtSetDevice(saved_device);
+        if (result == cnrtSuccess) return result;
+        if (getCurrentTimeInNano() + backoff_nano >= deadline_nano) {
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::nanoseconds(backoff_nano));
+        backoff_nano = std::min(backoff_nano * 2, kMaxBackoffNano);
+    }
+}
+
+// Queries a group's tail notifier and, once the group is done, releases the
+// notifier immediately so the device pool gets it back without waiting for the
+// batch to be freed.
+void resolveGroup(CnclCompletionGroup* group) {
+    if (!group) return;
+    {
+        std::lock_guard<std::mutex> lock(group->resolve_mutex);
+        if (group->resolved.load(std::memory_order_relaxed)) return;
+        // Not armed yet: the notifier is not on the queue, so there is
+        // nothing to query. A later poll picks it up.
+        if (!group->armed.load(std::memory_order_relaxed)) return;
+
+        int saved_device = -1;
+        cnrtGetDevice(&saved_device);
+        cnrtSetDevice(group->device_id);
+        cnrtRet_t result = cnrtQueryNotifier(group->notifier);
+        if (saved_device >= 0) cnrtSetDevice(saved_device);
+
+        if (result == cnrtSuccess) {
+            group->resolved.store(true, std::memory_order_release);
+        } else if (result != cnrtErrorNotReady) {
+            cnrtGetLastError();
+            LOG(ERROR) << "[CNCL] transfer failed: "
+                       << cnrtError(result, "cnrtQueryNotifier");
+            group->failed.store(true, std::memory_order_release);
+            group->resolved.store(true, std::memory_order_release);
+        } else if (group->deadline_nano > 0 &&
+                   getCurrentTimeInNano() > group->deadline_nano) {
+            LOG(ERROR) << "[CNCL] completion notifier unresolved after "
+                       << (getCurrentTimeInNano() - group->start_nano) / 1e9
+                       << "s (device=" << group->device_id
+                       << "); failing the group";
+            group->failed.store(true, std::memory_order_release);
+            group->resolved.store(true, std::memory_order_release);
+        }
+    }
+    if (group->resolved.load(std::memory_order_relaxed)) {
+        freeGroupNotifier(group);
+    }
+}
+
+// Places the group's tail notifier on the session queue. Must run after every
+// send of the group has been enqueued: the queue is FIFO, so the notifier
+// completes only once all of them have. The caller passes the session's submit
+// lock so the place cannot interleave with a send that is still being issued
+// on the same session.
+int armGroup(std::mutex& submit_mutex, cnrtQueue_t queue,
+             CnclCompletionGroup* group, bool has_sends, std::string* error) {
+    if (!has_sends) {
+        // Nothing reached the queue, so there is nothing to wait for.
+        group->resolved.store(true, std::memory_order_release);
+        freeGroupNotifier(group);
+        return 0;
+    }
+    cnrtRet_t result = cnrtSuccess;
+    {
+        std::lock_guard<std::mutex> lock(submit_mutex);
+        int saved_device = -1;
+        cnrtGetDevice(&saved_device);
+        cnrtSetDevice(group->device_id);
+        result = cnrtPlaceNotifier(group->notifier, queue);
+        if (result != cnrtSuccess) {
+            // The sends are already enqueued. Do not let the caller reuse or
+            // free their source buffers until the queue has drained.
+            cnrtQueueSync(queue);
+        }
+        if (saved_device >= 0) cnrtSetDevice(saved_device);
+    }
+    if (result != cnrtSuccess) {
+        if (error) *error = cnrtError(result, "cnrtPlaceNotifier");
+        group->failed.store(true, std::memory_order_release);
+        group->resolved.store(true, std::memory_order_release);
+        freeGroupNotifier(group);
+        return -1;
+    }
+    group->armed.store(true, std::memory_order_relaxed);
+    return 0;
 }
 
 // CNCL refuses to initialize the same clique id twice within one process
@@ -245,8 +404,11 @@ class CnclSession {
     }
 
     const std::string& cliqueIdString() const { return clique_id_string_; }
+    const std::string& key() const { return key_; }
     int rank() const { return rank_; }
     int peerRank() const { return 1 - rank_; }
+    int localDevice() const { return local_device_; }
+    cnrtQueue_t queue() const { return queue_; }
 
     void start() {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -298,8 +460,9 @@ class CnclSession {
     // Writer side of a WRITE. The caller must hold submit_mutex() across the
     // reservation RPC and this call (see submitWrite below) so the order in
     // which sends and matching recvs are issued is identical on both sides.
-    int enqueueSend(const void* source, size_t length, cnrtNotifier_t notifier,
-                    std::string* error) {
+    // Completion is not tracked here: the caller places one notifier after the
+    // whole group of sends (see armGroup).
+    int enqueueSend(const void* source, size_t length, std::string* error) {
         if (!waitReady(error)) return -1;
         std::lock_guard<std::mutex> lock(enqueue_mutex_);
         int saved_device = -1;
@@ -312,23 +475,10 @@ class CnclSession {
 
         cnclResult_t result = cnclSend(const_cast<void*>(source), length,
                                        cnclUint8, peerRank(), comm_, queue_);
-        cnrtRet_t place_result = cnrtSuccess;
-        if (result == CNCL_RET_SUCCESS && notifier) {
-            place_result = cnrtPlaceNotifier(notifier, queue_);
-        }
         if (saved_device >= 0) cnrtSetDevice(saved_device);
 
         if (result != CNCL_RET_SUCCESS) {
             if (error) *error = cnclError(result, "cnclSend");
-            return -1;
-        }
-        if (place_result != cnrtSuccess) {
-            // The send is already enqueued. Do not let the caller reuse or
-            // free its source until the queue has drained.
-            cnrtSetDevice(local_device_);
-            cnrtQueueSync(queue_);
-            if (saved_device >= 0) cnrtSetDevice(saved_device);
-            if (error) *error = cnrtError(place_result, "cnrtPlaceNotifier");
             return -1;
         }
         return 0;
@@ -581,6 +731,10 @@ class CnclTransport::Impl {
 
     Status submitTasks(const std::vector<TransferTask*>& task_list) {
         Status overall = Status::OK();
+        // Phase 1 resolves each descriptor's metadata and session without
+        // touching the device, so a request that cannot be sent never costs a
+        // notifier.
+        std::vector<PendingSend> pending;
         for (TransferTask* task : task_list) {
             if (!task || !task->request) {
                 overall = Status::InvalidArgument("Missing CNCL request");
@@ -597,9 +751,9 @@ class CnclTransport::Impl {
             slice->task = task;
             slice->status = Slice::PENDING;
             slice->ts = getCurrentTimeInNano();
-            slice->cncl.notifier = nullptr;
+            slice->cncl.group = nullptr;
             slice->cncl.device_id = -1;
-            slice->cleanup_callback = destroyCnclSliceNotifier;
+            slice->cleanup_callback = releaseCnclSliceResources;
             task->slice_list.push_back(slice);
             __sync_fetch_and_add(&task->slice_count, 1);
 
@@ -650,34 +804,101 @@ class CnclTransport::Impl {
                                              remote_buffer.device_id, &error);
             }
 
-            if (error.empty()) {
-                int saved_device = -1;
-                cnrtGetDevice(&saved_device);
-                cnrtSetDevice(local_device);
-                cnrtNotifier_t notifier = nullptr;
-                cnrtRet_t cnrt_result = cnrtNotifierCreate(&notifier);
-                if (saved_device >= 0) cnrtSetDevice(saved_device);
-                if (cnrt_result != cnrtSuccess) {
-                    error = cnrtError(cnrt_result, "cnrtNotifierCreate");
-                } else if (submitWrite(session, target->name, local_device,
-                                       remote_buffer.device_id,
-                                       request.target_offset, request.source,
-                                       request.length, notifier, &error) == 0) {
-                    slice->cncl.notifier = notifier;
-                    slice->cncl.device_id = local_device;
-                    slice->status = Slice::POSTED;
-                } else {
-                    cnrtSetDevice(local_device);
-                    cnrtNotifierDestroy(notifier);
-                    if (saved_device >= 0) cnrtSetDevice(saved_device);
-                }
-            }
-
             if (!error.empty()) {
-                destroyCnclSliceNotifier(slice);
                 LOG(ERROR) << "[CNCL] submit failed: " << error;
                 slice->markFailed();
                 if (overall.ok()) overall = Status::Context(error);
+                continue;
+            }
+
+            pending.push_back(PendingSend{slice, std::move(session),
+                                          request.source, request.length,
+                                          request.target_offset, local_device,
+                                          remote_buffer.device_id,
+                                          target->name});
+        }
+
+        // Phase 2 groups the pending sends by session and creates one notifier
+        // per group instead of one per descriptor.
+        std::unordered_map<CnclSession*, size_t> group_index;
+        std::vector<std::vector<size_t>> group_members;
+        for (size_t index = 0; index < pending.size(); ++index) {
+            CnclSession* key = pending[index].session.get();
+            auto inserted = group_index.emplace(key, group_members.size());
+            if (inserted.second) group_members.emplace_back();
+            group_members[inserted.first->second].push_back(index);
+        }
+
+        for (const auto& members : group_members) {
+            const std::shared_ptr<CnclSession>& session =
+                pending[members.front()].session;
+            const int device_id = session->localDevice();
+
+            cnrtNotifier_t notifier = nullptr;
+            cnrtRet_t cnrt_result =
+                createNotifierWithRetry(device_id, &notifier);
+            if (cnrt_result != cnrtSuccess) {
+                const std::string error =
+                    cnrtError(cnrt_result, "cnrtNotifierCreate");
+                // One log line per group: the pool is shared, so a burst would
+                // otherwise emit one line per descriptor.
+                LOG(ERROR) << "[CNCL] submit failed for " << members.size()
+                           << " request(s) on session " << session->key()
+                           << ": " << error;
+                for (size_t index : members) {
+                    pending[index].slice->markFailed();
+                }
+                if (overall.ok()) overall = Status::Context(error);
+                continue;
+            }
+
+            auto* group = new CnclCompletionGroup();
+            group->notifier = notifier;
+            group->device_id = device_id;
+            group->start_nano = getCurrentTimeInNano();
+            const int64_t timeout_nano =
+                globalConfig().cncl_group_timeout * 1000LL * 1000 * 1000;
+            group->deadline_nano =
+                timeout_nano > 0 ? group->start_nano + timeout_nano : 0;
+
+            bool has_sends = false;
+            std::string group_error;
+            for (size_t index : members) {
+                PendingSend& send = pending[index];
+                // The slice holds a reference from the moment the group
+                // exists, so a failure below still leaves the group reachable
+                // for cleanup.
+                send.slice->cncl.group = group;
+                send.slice->cncl.device_id = device_id;
+                group->slice_refs.fetch_add(1, std::memory_order_relaxed);
+
+                std::string error;
+                if (submitWrite(send.session, send.peer_name,
+                                send.local_device, send.peer_device,
+                                send.dest_addr, send.source, send.length,
+                                &error) == 0) {
+                    send.slice->status = Slice::POSTED;
+                    has_sends = true;
+                } else {
+                    LOG(ERROR) << "[CNCL] submit failed: " << error;
+                    send.slice->markFailed();
+                    if (group_error.empty()) group_error = error;
+                }
+            }
+            if (!group_error.empty() && overall.ok()) {
+                overall = Status::Context(group_error);
+            }
+
+            // Phase 3 arms the group once all of its sends are on the queue.
+            std::string arm_error;
+            if (armGroup(session->submitMutex(), session->queue(), group,
+                         has_sends, &arm_error) != 0) {
+                LOG(ERROR) << "[CNCL] submit failed: " << arm_error;
+                for (size_t index : members) {
+                    Slice* slice = pending[index].slice;
+                    if (slice->status == Slice::POSTED) slice->markFailed();
+                }
+                if (overall.ok()) overall = Status::Context(arm_error);
             }
         }
         return overall;
@@ -689,25 +910,31 @@ class CnclTransport::Impl {
             return Status::InvalidArgument("CNCL task ID out of range");
         }
         auto& task = batch.task_list[task_id];
+        // A group covers every slice submitted on its session in one batch, so
+        // query each distinct group once instead of once per slice.
+        std::vector<CnclCompletionGroup*> queried;
         for (Slice* slice : task.slice_list) {
             if (!slice || slice->status != Slice::POSTED) continue;
-            int saved_device = -1;
-            cnrtGetDevice(&saved_device);
-            cnrtSetDevice(slice->cncl.device_id);
-            cnrtNotifier_t notifier =
-                reinterpret_cast<cnrtNotifier_t>(slice->cncl.notifier);
-            cnrtRet_t result = cnrtQueryNotifier(notifier);
-            if (result == cnrtSuccess) {
-                destroyCnclSliceNotifier(slice);
-                slice->markSuccess();
-            } else if (result != cnrtErrorNotReady) {
-                cnrtGetLastError();
-                LOG(ERROR) << "[CNCL] transfer failed: "
-                           << cnrtError(result, "cnrtQueryNotifier");
-                destroyCnclSliceNotifier(slice);
-                slice->markFailed();
+            auto* group = static_cast<CnclCompletionGroup*>(slice->cncl.group);
+            if (!group) continue;
+            if (std::find(queried.begin(), queried.end(), group) !=
+                queried.end()) {
+                continue;
             }
-            if (saved_device >= 0) cnrtSetDevice(saved_device);
+            queried.push_back(group);
+            resolveGroup(group);
+        }
+        for (Slice* slice : task.slice_list) {
+            if (!slice || slice->status != Slice::POSTED) continue;
+            auto* group = static_cast<CnclCompletionGroup*>(slice->cncl.group);
+            if (!group || !group->resolved.load(std::memory_order_acquire)) {
+                continue;
+            }
+            if (group->failed.load(std::memory_order_acquire)) {
+                slice->markFailed();
+            } else {
+                slice->markSuccess();
+            }
         }
 
         uint64_t success_slice_count =
@@ -728,6 +955,18 @@ class CnclTransport::Impl {
     }
 
    private:
+    // A descriptor that passed validation and is waiting to be enqueued.
+    struct PendingSend {
+        Slice* slice;
+        std::shared_ptr<CnclSession> session;
+        const void* source;
+        size_t length;
+        uint64_t dest_addr;
+        int local_device;
+        int peer_device;
+        std::string peer_name;
+    };
+
     bool findMetadataBuffer(void* addr, BufferDesc* result) const {
         if (!result) return false;
         auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -1001,12 +1240,12 @@ class CnclTransport::Impl {
     // session-ordered step. The submit lock must cover the RPC round trip:
     // the reply is only sent after the peer queued the matching cnclRecv, so
     // sends and recvs are issued in the same order on both endpoints even
-    // when several writer threads share the session.
+    // when several writer threads share the session. Completion is tracked by
+    // the caller's group notifier, not per send.
     int submitWrite(const std::shared_ptr<CnclSession>& session,
                     const std::string& peer_name, int local_device,
                     int peer_device, uint64_t dest_addr, const void* source,
-                    size_t length, cnrtNotifier_t notifier,
-                    std::string* error) {
+                    size_t length, std::string* error) {
         std::lock_guard<std::mutex> lock(session->submitMutex());
 
         Json::Value request;
@@ -1025,7 +1264,7 @@ class CnclTransport::Impl {
             if (error) *error = "CNCL write handshake failed";
             return -1;
         }
-        return session->enqueueSend(source, length, notifier, error);
+        return session->enqueueSend(source, length, error);
     }
 
     int onHandshake(const HandShakeDesc& peer_desc, HandShakeDesc& local_desc) {

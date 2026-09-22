@@ -445,6 +445,17 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
     }
 
+    const char* cncl_group_timeout_env =
+        std::getenv("MC_CNCL_GROUP_TIMEOUT");
+    if (cncl_group_timeout_env) {
+        int val = atoi(cncl_group_timeout_env);
+        if (val > 0 && val < 65536)
+            config.cncl_group_timeout = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_CNCL_GROUP_TIMEOUT";
+    }
+
     const char* conn_pause_ttl_env = std::getenv("MC_CONN_PAUSE_TTL_MS");
     if (conn_pause_ttl_env) {
         // Robust parse (not atoi): a non-numeric typo must keep the default

@@ -83,6 +83,17 @@ struct GlobalConfig {
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    // CNCL transport: how long a submission group's completion notifier may
+    // stay unresolved before the group is failed. A two-sided transport has
+    // no shared completion ring to fall back on, so without this a group whose
+    // sends never complete keeps the caller polling forever. Keep it below
+    // MC_TRANSFER_TIMEOUT (the caller's own patience, 30s by default) so the
+    // engine reports the failure itself and the caller can free the batch;
+    // raise both together for workloads whose transfers legitimately take
+    // longer. Override via MC_CNCL_GROUP_TIMEOUT (seconds, 1..65535); a value
+    // outside that range is rejected and this default is kept, so a typo
+    // cannot silently remove the deadline.
+    int64_t cncl_group_timeout = 30;
     // Active-connect circuit-breaker. After an endpoint to a peer is torn down
     // (path failure / QP fatal), pause active reconnection to that peer's
     // address for this many milliseconds, so the posting worker is not

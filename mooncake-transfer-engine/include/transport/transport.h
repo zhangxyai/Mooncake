@@ -177,7 +177,8 @@ class Transport {
                 int device_id;
             } nccl;
             struct {
-                void *notifier;  // cnrtNotifier_t
+                void *group;  // CnclCompletionGroup *, shared by every slice
+                              // of one submission group on a session
                 int device_id;
             } cncl;
             struct {
