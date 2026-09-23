@@ -1434,6 +1434,18 @@ class CnclTransport::Impl {
         HandShakeDesc peer_desc;
         int result = metadata_->sendHandshake(peer_name, local_desc, peer_desc);
         if (result != 0) {
+            // A failed handshake is delivery-ambiguous: the peer may have
+            // processed the request (queuing the matching cnclRecv) and only
+            // the reply was lost, which is the same dangling-recv desync as
+            // the post-handshake send failure below. And when the peer never
+            // processed it, an unreachable peer dooms every later handshake
+            // anyway. Either way the session must never be used again; the
+            // quarantine also turns a dead peer into one fast failure per
+            // group instead of one RPC timeout per descriptor, all serialized
+            // under the group submit lock.
+            session->failSession(
+                "CNCL write handshake failed; the peer may hold a dangling "
+                "cnclRecv and the session is disabled");
             if (error) *error = "CNCL write handshake failed";
             return -1;
         }
