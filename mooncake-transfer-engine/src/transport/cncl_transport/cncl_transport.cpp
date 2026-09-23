@@ -895,8 +895,9 @@ class CnclTransport::Impl {
                          has_sends, &arm_error) != 0) {
                 LOG(ERROR) << "[CNCL] submit failed: " << arm_error;
                 for (size_t index : members) {
-                    Slice* slice = pending[index].slice;
-                    if (slice->status == Slice::POSTED) slice->markFailed();
+                    // The group is already resolved as failed, so a
+                    // concurrent poller may mark these slices first.
+                    pending[index].slice->tryMarkFailed();
                 }
                 if (overall.ok()) overall = Status::Context(arm_error);
             }
@@ -914,7 +915,10 @@ class CnclTransport::Impl {
         // query each distinct group once instead of once per slice.
         std::vector<CnclCompletionGroup*> queried;
         for (Slice* slice : task.slice_list) {
-            if (!slice || slice->status != Slice::POSTED) continue;
+            if (!slice || __atomic_load_n(&slice->status, __ATOMIC_ACQUIRE) !=
+                              Slice::POSTED) {
+                continue;
+            }
             auto* group = static_cast<CnclCompletionGroup*>(slice->cncl.group);
             if (!group) continue;
             if (std::find(queried.begin(), queried.end(), group) !=
@@ -925,15 +929,20 @@ class CnclTransport::Impl {
             resolveGroup(group);
         }
         for (Slice* slice : task.slice_list) {
-            if (!slice || slice->status != Slice::POSTED) continue;
+            if (!slice || __atomic_load_n(&slice->status, __ATOMIC_ACQUIRE) !=
+                              Slice::POSTED) {
+                continue;
+            }
             auto* group = static_cast<CnclCompletionGroup*>(slice->cncl.group);
             if (!group || !group->resolved.load(std::memory_order_acquire)) {
                 continue;
             }
+            // tryMark*: a concurrent poller of the same batch (or abortBatch)
+            // may resolve the same slice; only the first transition counts.
             if (group->failed.load(std::memory_order_acquire)) {
-                slice->markFailed();
+                slice->tryMarkFailed();
             } else {
-                slice->markSuccess();
+                slice->tryMarkSuccess();
             }
         }
 

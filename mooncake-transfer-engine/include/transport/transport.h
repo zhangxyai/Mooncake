@@ -227,6 +227,44 @@ class Transport {
             check_batch_completion(task, true);
         }
 
+        // Idempotent variants of markSuccess/markFailed: only the first
+        // terminal transition wins and updates the counters, so concurrent
+        // pollers (or a poller racing Transport::abortBatch) cannot
+        // double-count a slice. A double-count would push
+        // success+failed past slice_count and hang the batch forever.
+        // Returns true when this call performed the transition.
+        bool tryMarkSuccess() {
+            SliceStatus expected = Slice::POSTED;
+            if (!__atomic_compare_exchange_n(&status, &expected,
+                                             Slice::SUCCESS, false,
+                                             __ATOMIC_ACQ_REL,
+                                             __ATOMIC_ACQUIRE)) {
+                return false;
+            }
+            __atomic_fetch_add(&task->transferred_bytes, length,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
+
+            check_batch_completion(task, false);
+            return true;
+        }
+
+        bool tryMarkFailed() {
+            for (SliceStatus expected : {Slice::PENDING, Slice::POSTED}) {
+                if (__atomic_compare_exchange_n(&status, &expected,
+                                                Slice::FAILED, false,
+                                                __ATOMIC_ACQ_REL,
+                                                __ATOMIC_ACQUIRE)) {
+                    __atomic_fetch_add(&task->failed_slice_count, 1,
+                                       __ATOMIC_ACQ_REL);
+
+                    check_batch_completion(task, true);
+                    return true;
+                }
+            }
+            return false;
+        }
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         static void sealTaskSubmission(TransferTask *task) {
             __atomic_store_n(&task->submission_sealed, true, __ATOMIC_RELEASE);
