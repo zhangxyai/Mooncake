@@ -41,8 +41,10 @@ namespace mooncake {
 // CNCL matches cnclSend/cnclRecv per rank pair in issue order and forbids
 // initializing the same clique id twice within one process. Consequently:
 // - both endpoints of a session must live in separate processes, and
-// - the per-session submit lock spans the reservation RPC and the cnclSend
-//   enqueue so both endpoints issue their operations in the same order.
+// - the per-session submit lock spans a whole submission group (every
+//   reservation-RPC + cnclSend pair plus the tail notifier), so both
+//   endpoints issue their operations in the same order and the lock's FIFO
+//   order rotates groups, not single sends, between writer threads.
 //
 // Only WRITE is supported. READ is rejected with
 // Status::NotSupportedTransport without submitting a CNCL operation: a READ

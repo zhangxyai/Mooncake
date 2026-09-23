@@ -358,31 +358,27 @@ void settleGroupWithBudget(CnclCompletionGroup* group) {
 
 // Places the group's tail notifier on the session queue. Must run after every
 // send of the group has been enqueued: the queue is FIFO, so the notifier
-// completes only once all of them have. The caller passes the session's submit
-// lock so the place cannot interleave with a send that is still being issued
-// on the same session.
-int armGroup(TicketLock& submit_mutex, cnrtQueue_t queue,
-             CnclCompletionGroup* group, bool has_sends, std::string* error) {
+// completes only once all of them have. The caller must hold the session's
+// submit lock so the place cannot interleave with a send that is still being
+// issued on the same session.
+int armGroup(cnrtQueue_t queue, CnclCompletionGroup* group, bool has_sends,
+             std::string* error) {
     if (!has_sends) {
         // Nothing reached the queue, so there is nothing to wait for.
         group->resolved.store(true, std::memory_order_release);
         freeGroupNotifier(group);
         return 0;
     }
-    cnrtRet_t result = cnrtSuccess;
-    {
-        std::lock_guard<TicketLock> lock(submit_mutex);
-        int saved_device = -1;
-        cnrtGetDevice(&saved_device);
-        cnrtSetDevice(group->device_id);
-        result = cnrtPlaceNotifier(group->notifier, queue);
-        if (result != cnrtSuccess) {
-            // The sends are already enqueued. Do not let the caller reuse or
-            // free their source buffers until the queue has drained.
-            cnrtQueueSync(queue);
-        }
-        if (saved_device >= 0) cnrtSetDevice(saved_device);
+    int saved_device = -1;
+    cnrtGetDevice(&saved_device);
+    cnrtSetDevice(group->device_id);
+    const cnrtRet_t result = cnrtPlaceNotifier(group->notifier, queue);
+    if (result != cnrtSuccess) {
+        // The sends are already enqueued. Do not let the caller reuse or
+        // free their source buffers until the queue has drained.
+        cnrtQueueSync(queue);
     }
+    if (saved_device >= 0) cnrtSetDevice(saved_device);
     if (result != cnrtSuccess) {
         if (error) *error = cnrtError(result, "cnrtPlaceNotifier");
         group->failed.store(true, std::memory_order_release);
@@ -922,6 +918,14 @@ class CnclTransport::Impl {
                     timeout_nano > 0 ? group->start_nano + timeout_nano : 0;
 
                 std::string group_error;
+                // The submit lock is taken once per group rather than per
+                // descriptor: the [handshake RPC -> cnclSend] pairs stay
+                // session-ordered (now as one uninterrupted run), and the
+                // ticket lock's FIFO order then rotates whole groups between
+                // writer threads. Per-descriptor acquisition would instead
+                // round-robin single sends across all threads, stretching
+                // every batch of a wave to the wave's full duration.
+                std::lock_guard<TicketLock> submit_lock(session->submitMutex());
                 for (size_t index : members) {
                     PendingSend& send = pending[index];
                     // The slice holds a reference from the moment the group
@@ -949,10 +953,11 @@ class CnclTransport::Impl {
                 }
 
                 // Phase 3 arms the group once all of its sends are on the
-                // queue.
+                // queue, still under the group submit lock so the tail
+                // notifier cannot jump ahead of a send of the next group.
                 std::string arm_error;
-                if (armGroup(session->submitMutex(), session->queue(), group,
-                             has_sends, &arm_error) != 0) {
+                if (armGroup(session->queue(), group, has_sends, &arm_error) !=
+                    0) {
                     LOG(ERROR) << "[CNCL] submit failed: " << arm_error;
                     for (size_t index : members) {
                         // The group is already resolved as failed, so a
@@ -977,11 +982,18 @@ class CnclTransport::Impl {
                     // Arm whatever reached the queue so the group has a tail
                     // to resolve on, then settle it. The caller may reuse
                     // source buffers once the group resolves, which is the
-                    // same contract as the group-deadline path.
+                    // same contract as the group-deadline path. The group
+                    // submit lock was released by the unwind, so retake it
+                    // just for the arm; the settle wait must not run under
+                    // the lock or it would stall every writer on the session.
                     if (!group->resolved.load(std::memory_order_acquire)) {
                         std::string arm_error;
-                        armGroup(session->submitMutex(), session->queue(),
-                                 group, has_sends, &arm_error);
+                        {
+                            std::lock_guard<TicketLock> lock(
+                                session->submitMutex());
+                            armGroup(session->queue(), group, has_sends,
+                                     &arm_error);
+                        }
                         settleGroupWithBudget(group);
                     }
                     if (group->slice_refs.load(std::memory_order_acquire) ==
@@ -1388,11 +1400,13 @@ class CnclTransport::Impl {
     }
 
     // Reserve the peer's cnclRecv and enqueue the local cnclSend as one
-    // session-ordered step. The submit lock must cover the RPC round trip:
-    // the reply is only sent after the peer queued the matching cnclRecv, so
-    // sends and recvs are issued in the same order on both endpoints even
-    // when several writer threads share the session. Completion is tracked by
-    // the caller's group notifier, not per send.
+    // session-ordered step. The caller holds the submit lock across the whole
+    // group of sends, so each [handshake RPC -> cnclSend] pair is atomic and
+    // the lock's FIFO order applies per group: the reply is only sent after
+    // the peer queued the matching cnclRecv, so sends and recvs are issued in
+    // the same order on both endpoints even when several writer threads share
+    // the session. Completion is tracked by the caller's group notifier, not
+    // per send.
     int submitWrite(const std::shared_ptr<CnclSession>& session,
                     const std::string& peer_name, int local_device,
                     int peer_device, uint64_t dest_addr, const void* source,
@@ -1408,15 +1422,10 @@ class CnclTransport::Impl {
         HandShakeDesc local_desc;
         local_desc.payload = encodeJson(request);
 
-        // The JSON build above is pure-local; the lock only has to cover the
-        // [handshake RPC -> cnclSend] pair, which must stay atomic so both
-        // endpoints issue their operations in the same order.
-        std::lock_guard<TicketLock> lock(session->submitMutex());
-
         // A session poisoned by an earlier post-handshake send failure can
         // never be re-synchronized; fail fast instead of queuing another
-        // dangling cnclRecv on the peer. Checked under the submit lock so it
-        // is ordered against the failSession below.
+        // dangling cnclRecv on the peer. Ordered against the failSession
+        // below by the caller's hold on the submit lock.
         if (session->isFailed()) {
             if (error) *error = "CNCL session is disabled";
             return -1;

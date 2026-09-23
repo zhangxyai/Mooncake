@@ -911,8 +911,12 @@ int runSender(const Flags& f, const Layout& l) {
     if (killer.joinable()) killer.join();
 
     int64_t done = 0, submit_failed = 0, failed = 0, timed_out = 0, gold = 0;
+    int64_t min_done = INT64_MAX, max_done = 0;
     for (auto& s : states) {
-        done += s->done.load();
+        const int64_t d = s->done.load();
+        done += d;
+        min_done = std::min(min_done, d);
+        max_done = std::max(max_done, d);
         submit_failed += s->submit_failed.load();
         failed += s->failed.load();
         timed_out += s->timed_out.load();
@@ -922,6 +926,11 @@ int runSender(const Flags& f, const Layout& l) {
               << " submit_failed=" << submit_failed << " failed=" << failed
               << " timeout=" << timed_out << " gold_ok=" << gold << "/"
               << f.threads;
+    // Fairness evidence: a starved submission path shows up as min_done=0
+    // next to a large max_done (57 threads never finished a single batch in
+    // the incident-shape run); a fair one keeps the spread small.
+    LOG(INFO) << "[stress] per-thread done: min=" << min_done
+              << " max=" << max_done;
 
     // Hand over to the receiver for the final verification.
     if (!writeFile(filePath(f.workdir, "stressDone.0"),
