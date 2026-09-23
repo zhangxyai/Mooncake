@@ -361,7 +361,7 @@ void settleGroupWithBudget(CnclCompletionGroup* group) {
 // completes only once all of them have. The caller passes the session's submit
 // lock so the place cannot interleave with a send that is still being issued
 // on the same session.
-int armGroup(std::mutex& submit_mutex, cnrtQueue_t queue,
+int armGroup(TicketLock& submit_mutex, cnrtQueue_t queue,
              CnclCompletionGroup* group, bool has_sends, std::string* error) {
     if (!has_sends) {
         // Nothing reached the queue, so there is nothing to wait for.
@@ -371,7 +371,7 @@ int armGroup(std::mutex& submit_mutex, cnrtQueue_t queue,
     }
     cnrtRet_t result = cnrtSuccess;
     {
-        std::lock_guard<std::mutex> lock(submit_mutex);
+        std::lock_guard<TicketLock> lock(submit_mutex);
         int saved_device = -1;
         cnrtGetDevice(&saved_device);
         cnrtSetDevice(group->device_id);
@@ -527,8 +527,22 @@ class CnclSession {
     // matches cnclSend/cnclRecv per rank pair in issue order, and the RPC
     // round trip makes the peer enqueue its matching cnclRecv first; holding
     // this lock across both steps keeps every writer on the session issuing
-    // operations in the same order the peer queues their recvs.
-    std::mutex& submitMutex() { return submit_mutex_; }
+    // operations in the same order the peer queues their recvs. The FIFO
+    // ticket order also keeps concurrent writers' batches progressing
+    // evenly instead of starving the unlucky ones.
+    TicketLock& submitMutex() { return submit_mutex_; }
+
+    // Permanently disables the session after an unrecoverable data-plane
+    // error (a cnclSend that failed after the peer already queued the
+    // matching cnclRecv, which would desynchronize the session's FIFO
+    // pairing). Subsequent submits fail fast instead of silently
+    // mis-delivering later sends.
+    void failSession(const std::string& error) { setFailure(error); }
+
+    bool isFailed() {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return failed_;
+    }
 
    private:
     void setFailure(const std::string& error) {
@@ -635,7 +649,11 @@ class CnclSession {
     cnclComm_t comm_ = nullptr;
     cnrtQueue_t queue_ = nullptr;
     std::mutex enqueue_mutex_;
-    std::mutex submit_mutex_;
+    // Ticket lock, not a plain mutex: with 100+ writer threads per session a
+    // re-acquiring holder would otherwise barge past waiters on every slice
+    // and starve them (observed: 57/128 threads stuck for 250s on their
+    // first batch while others cycled).
+    TicketLock submit_mutex_;
 };
 
 }  // namespace
@@ -874,71 +892,109 @@ class CnclTransport::Impl {
             const int device_id = session->localDevice();
 
             cnrtNotifier_t notifier = nullptr;
-            cnrtRet_t cnrt_result =
-                createNotifierWithRetry(device_id, &notifier);
-            if (cnrt_result != cnrtSuccess) {
-                const std::string error =
-                    cnrtError(cnrt_result, "cnrtNotifierCreate");
-                // One log line per group: the pool is shared, so a burst would
-                // otherwise emit one line per descriptor.
-                LOG(ERROR) << "[CNCL] submit failed for " << members.size()
-                           << " request(s) on session " << session->key()
-                           << ": " << error;
-                for (size_t index : members) {
-                    pending[index].slice->markFailed();
-                }
-                if (overall.ok()) overall = Status::Context(error);
-                continue;
-            }
-
-            auto* group = new CnclCompletionGroup();
-            group->notifier = notifier;
-            group->device_id = device_id;
-            group->start_nano = getCurrentTimeInNano();
-            const int64_t timeout_nano =
-                globalConfig().cncl_group_timeout * 1000LL * 1000 * 1000;
-            group->deadline_nano =
-                timeout_nano > 0 ? group->start_nano + timeout_nano : 0;
-
+            CnclCompletionGroup* group = nullptr;
             bool has_sends = false;
-            std::string group_error;
-            for (size_t index : members) {
-                PendingSend& send = pending[index];
-                // The slice holds a reference from the moment the group
-                // exists, so a failure below still leaves the group reachable
-                // for cleanup.
-                send.slice->cncl.group = group;
-                send.slice->cncl.device_id = device_id;
-                group->slice_refs.fetch_add(1, std::memory_order_relaxed);
-
-                std::string error;
-                if (submitWrite(send.session, send.peer_name,
-                                send.local_device, send.peer_device,
-                                send.dest_addr, send.source, send.length,
-                                &error) == 0) {
-                    send.slice->status = Slice::POSTED;
-                    has_sends = true;
-                } else {
-                    LOG(ERROR) << "[CNCL] submit failed: " << error;
-                    send.slice->markFailed();
-                    if (group_error.empty()) group_error = error;
+            try {
+                cnrtRet_t cnrt_result =
+                    createNotifierWithRetry(device_id, &notifier);
+                if (cnrt_result != cnrtSuccess) {
+                    const std::string error =
+                        cnrtError(cnrt_result, "cnrtNotifierCreate");
+                    // One log line per group: the pool is shared, so a burst
+                    // would otherwise emit one line per descriptor.
+                    LOG(ERROR) << "[CNCL] submit failed for " << members.size()
+                               << " request(s) on session " << session->key()
+                               << ": " << error;
+                    for (size_t index : members) {
+                        pending[index].slice->markFailed();
+                    }
+                    if (overall.ok()) overall = Status::Context(error);
+                    continue;
                 }
-            }
-            if (!group_error.empty() && overall.ok()) {
-                overall = Status::Context(group_error);
-            }
 
-            // Phase 3 arms the group once all of its sends are on the queue.
-            std::string arm_error;
-            if (armGroup(session->submitMutex(), session->queue(), group,
-                         has_sends, &arm_error) != 0) {
-                LOG(ERROR) << "[CNCL] submit failed: " << arm_error;
+                group = new CnclCompletionGroup();
+                group->notifier = notifier;
+                group->device_id = device_id;
+                group->start_nano = getCurrentTimeInNano();
+                const int64_t timeout_nano =
+                    globalConfig().cncl_group_timeout * 1000LL * 1000 * 1000;
+                group->deadline_nano =
+                    timeout_nano > 0 ? group->start_nano + timeout_nano : 0;
+
+                std::string group_error;
                 for (size_t index : members) {
-                    // The group is already resolved as failed, so a
-                    // concurrent poller may mark these slices first.
+                    PendingSend& send = pending[index];
+                    // The slice holds a reference from the moment the group
+                    // exists, so a failure below still leaves the group
+                    // reachable for cleanup.
+                    send.slice->cncl.group = group;
+                    send.slice->cncl.device_id = device_id;
+                    group->slice_refs.fetch_add(1, std::memory_order_relaxed);
+
+                    std::string error;
+                    if (submitWrite(send.session, send.peer_name,
+                                    send.local_device, send.peer_device,
+                                    send.dest_addr, send.source, send.length,
+                                    &error) == 0) {
+                        send.slice->status = Slice::POSTED;
+                        has_sends = true;
+                    } else {
+                        LOG(ERROR) << "[CNCL] submit failed: " << error;
+                        send.slice->markFailed();
+                        if (group_error.empty()) group_error = error;
+                    }
+                }
+                if (!group_error.empty() && overall.ok()) {
+                    overall = Status::Context(group_error);
+                }
+
+                // Phase 3 arms the group once all of its sends are on the
+                // queue.
+                std::string arm_error;
+                if (armGroup(session->submitMutex(), session->queue(), group,
+                             has_sends, &arm_error) != 0) {
+                    LOG(ERROR) << "[CNCL] submit failed: " << arm_error;
+                    for (size_t index : members) {
+                        // The group is already resolved as failed, so a
+                        // concurrent poller may mark these slices first.
+                        pending[index].slice->tryMarkFailed();
+                    }
+                    if (overall.ok()) overall = Status::Context(arm_error);
+                }
+            } catch (const std::exception& exception) {
+                // A throw (e.g. from the JSON handshake build) must not leak
+                // the group or its notifier, and must not strand the member
+                // slices: an unsettled group would keep the batch busy
+                // forever.
+                const std::string error = std::string("CNCL submit exception: ") +
+                                          exception.what();
+                LOG(ERROR) << "[CNCL] submit failed: " << error;
+                if (!group) {
+                    // The group object was never formed; the freshly created
+                    // notifier has no owner yet.
+                    if (notifier) destroyNotifier(notifier, device_id);
+                } else {
+                    // Arm whatever reached the queue so the group has a tail
+                    // to resolve on, then settle it. The caller may reuse
+                    // source buffers once the group resolves, which is the
+                    // same contract as the group-deadline path.
+                    if (!group->resolved.load(std::memory_order_acquire)) {
+                        std::string arm_error;
+                        armGroup(session->submitMutex(), session->queue(),
+                                 group, has_sends, &arm_error);
+                        settleGroupWithBudget(group);
+                    }
+                    if (group->slice_refs.load(std::memory_order_acquire) ==
+                        0) {
+                        // The throw happened before any slice adopted the
+                        // group; nothing else will delete it.
+                        delete group;
+                    }
+                }
+                for (size_t index : members) {
                     pending[index].slice->tryMarkFailed();
                 }
-                if (overall.ok()) overall = Status::Context(arm_error);
+                if (overall.ok()) overall = Status::Context(error);
             }
         }
         return overall;
@@ -1341,8 +1397,6 @@ class CnclTransport::Impl {
                     const std::string& peer_name, int local_device,
                     int peer_device, uint64_t dest_addr, const void* source,
                     size_t length, std::string* error) {
-        std::lock_guard<std::mutex> lock(session->submitMutex());
-
         Json::Value request;
         request["op"] = "write";
         request["peer_name"] = local_server_name_;
@@ -1353,13 +1407,38 @@ class CnclTransport::Impl {
 
         HandShakeDesc local_desc;
         local_desc.payload = encodeJson(request);
+
+        // The JSON build above is pure-local; the lock only has to cover the
+        // [handshake RPC -> cnclSend] pair, which must stay atomic so both
+        // endpoints issue their operations in the same order.
+        std::lock_guard<TicketLock> lock(session->submitMutex());
+
+        // A session poisoned by an earlier post-handshake send failure can
+        // never be re-synchronized; fail fast instead of queuing another
+        // dangling cnclRecv on the peer. Checked under the submit lock so it
+        // is ordered against the failSession below.
+        if (session->isFailed()) {
+            if (error) *error = "CNCL session is disabled";
+            return -1;
+        }
+
         HandShakeDesc peer_desc;
         int result = metadata_->sendHandshake(peer_name, local_desc, peer_desc);
         if (result != 0) {
             if (error) *error = "CNCL write handshake failed";
             return -1;
         }
-        return session->enqueueSend(source, length, error);
+        if (session->enqueueSend(source, length, error) != 0) {
+            // The handshake reply means the peer already queued the matching
+            // cnclRecv. That recv now dangles and would pair with a later
+            // send, silently desynchronizing the session's FIFO ordering, so
+            // the session must never be used again.
+            session->failSession(
+                "cnclSend failed after the write handshake succeeded; the "
+                "peer has a dangling cnclRecv and the session is disabled");
+            return -1;
+        }
+        return 0;
     }
 
     int onHandshake(const HandShakeDesc& peer_desc, HandShakeDesc& local_desc) {
