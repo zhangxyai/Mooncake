@@ -456,6 +456,15 @@ class Transport {
     /// @brief Free an allocated batch.
     virtual Status freeBatchID(BatchID batch_id);
 
+    /// @brief Best-effort synchronous settlement of a batch whose tasks never
+    /// reached a terminal state, invoked by freeBatchID before refusing with
+    /// BatchBusy. Transports with caller-driven completion (no background
+    /// poller) override this to resolve or fail in-flight work so the batch
+    /// can be reclaimed instead of leaking. Must not race
+    /// submitTransfer/submitTransferTask on the same batch; may run
+    /// concurrently with getTransferStatus. Default no-op.
+    virtual void abortBatch(BatchID batch_id) {}
+
     /// @brief Submit a batch of transfer requests to the batch.
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.

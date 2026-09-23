@@ -42,11 +42,23 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
 Status Transport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
+    bool unfinished = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
-            LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+            unfinished = true;
+            break;
+        }
+    }
+    if (unfinished) {
+        // Give the transport a chance to settle in-flight work (e.g. a batch
+        // abandoned right after a failed submit) before refusing.
+        abortBatch(batch_id);
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            if (!batch_desc.task_list[task_id].is_finished) {
+                LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
+                return Status::BatchBusy(
+                    "BatchID cannot be freed until all tasks are done");
+            }
         }
     }
     delete &batch_desc;

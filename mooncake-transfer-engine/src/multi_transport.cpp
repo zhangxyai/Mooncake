@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 #include "config.h"
 #include "multi_transport_locality.h"
@@ -117,10 +118,33 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
                                    const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
+    bool unfinished = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+            unfinished = true;
+            break;
+        }
+    }
+    if (unfinished) {
+        // Give each involved transport a chance to settle its in-flight work
+        // (e.g. a batch abandoned right after a failed submit) before
+        // refusing. abortBatch is a no-op for transports with background
+        // completion.
+        std::unordered_set<Transport*> involved;
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            auto& task = batch_desc.task_list[task_id];
+            if (!task.is_finished && task.transport_) {
+                involved.insert(task.transport_);
+            }
+        }
+        for (Transport* transport : involved) {
+            transport->abortBatch(batch_id);
+        }
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            if (!batch_desc.task_list[task_id].is_finished) {
+                return Status::BatchBusy(
+                    "BatchID cannot be freed until all tasks are done");
+            }
         }
     }
     if (before_delete) {
