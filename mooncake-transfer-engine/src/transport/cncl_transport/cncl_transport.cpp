@@ -317,6 +317,45 @@ void resolveGroup(CnclCompletionGroup* group) {
     }
 }
 
+// Drives a group to resolution on behalf of a batch that is being freed
+// without further polling (abandoned after a failed submit or an outer
+// timeout). Waits for the tail notifier up to the group's own deadline,
+// capped at 30s; on expiry it mirrors resolveGroup's deadline policy — fail
+// the group and release the notifier even though it may still be queued
+// (see the comment at releaseCnclSliceResources).
+void settleGroupWithBudget(CnclCompletionGroup* group) {
+    constexpr int64_t kMaxWaitNano = 30LL * 1000 * 1000 * 1000;
+    const int64_t start = getCurrentTimeInNano();
+    for (;;) {
+        resolveGroup(group);
+        if (group->resolved.load(std::memory_order_acquire)) return;
+        if (!group->armed.load(std::memory_order_acquire)) {
+            // Never placed (only reachable via an exceptional submit path):
+            // the notifier is not queued, so releasing it is safe and there
+            // is nothing to wait for.
+            group->failed.store(true, std::memory_order_release);
+            group->resolved.store(true, std::memory_order_release);
+            freeGroupNotifier(group);
+            return;
+        }
+        int64_t budget_nano = kMaxWaitNano;
+        if (group->deadline_nano > 0) {
+            budget_nano = std::min(budget_nano, group->deadline_nano - start);
+        }
+        if (getCurrentTimeInNano() - start >= budget_nano) {
+            LOG(ERROR) << "[CNCL] abort: completion notifier unresolved after "
+                       << (getCurrentTimeInNano() - group->start_nano) / 1e9
+                       << "s (device=" << group->device_id
+                       << "); failing the group";
+            group->failed.store(true, std::memory_order_release);
+            group->resolved.store(true, std::memory_order_release);
+            freeGroupNotifier(group);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 // Places the group's tail notifier on the session queue. Must run after every
 // send of the group has been enqueued: the queue is FIFO, so the notifier
 // completes only once all of them have. The caller passes the session's submit
@@ -963,6 +1002,53 @@ class CnclTransport::Impl {
         return Status::OK();
     }
 
+    // Settles every task of a batch that is being freed without further
+    // polling. Failure to settle here makes freeBatchID refuse with
+    // BatchBusy, which leaks the BatchDesc, the slices, and every group
+    // notifier they hold — the failure mode that kept the notifier pool
+    // exhausted forever in the field.
+    void abortBatch(BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        // Defensive: submitTasks marks every slice it touches, so PENDING
+        // can only survive an exception between allocation and the send
+        // loop. Nothing else will ever transition such a slice.
+        for (auto& task : batch.task_list) {
+            for (Slice* slice : task.slice_list) {
+                if (!slice) continue;
+                if (__atomic_load_n(&slice->status, __ATOMIC_ACQUIRE) ==
+                    Slice::PENDING) {
+                    slice->tryMarkFailed();
+                }
+            }
+        }
+        std::vector<CnclCompletionGroup*> groups;
+        for (auto& task : batch.task_list) {
+            for (Slice* slice : task.slice_list) {
+                if (!slice || __atomic_load_n(&slice->status,
+                                              __ATOMIC_ACQUIRE) !=
+                                  Slice::POSTED) {
+                    continue;
+                }
+                auto* group =
+                    static_cast<CnclCompletionGroup*>(slice->cncl.group);
+                if (!group) continue;
+                if (std::find(groups.begin(), groups.end(), group) ==
+                    groups.end()) {
+                    groups.push_back(group);
+                }
+            }
+        }
+        for (auto* group : groups) settleGroupWithBudget(group);
+        // Publish task completion through the regular poll path so
+        // freeBatchID's is_finished scan can pass.
+        TransferStatus scratch;
+        for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
+            if (!batch.task_list[task_id].is_finished) {
+                poll(batch_id, task_id, scratch);
+            }
+        }
+    }
+
    private:
     // A descriptor that passed validation and is waiting to be enqueued.
     struct PendingSend {
@@ -1496,6 +1582,10 @@ Status CnclTransport::submitTransferTask(
 Status CnclTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                         TransferStatus& status) {
     return impl_->poll(batch_id, task_id, status);
+}
+
+void CnclTransport::abortBatch(BatchID batch_id) {
+    impl_->abortBatch(batch_id);
 }
 
 int CnclTransport::registerLocalMemory(void* addr, size_t length,

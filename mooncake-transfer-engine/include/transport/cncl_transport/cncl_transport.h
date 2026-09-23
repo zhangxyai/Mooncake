@@ -63,6 +63,12 @@ class CnclTransport final : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override;
 
+    // Completion is caller-driven (no background poller), so a batch that is
+    // freed without further polling — abandoned after a failed submit or an
+    // outer timeout — would leak its groups and notifiers. Settle them
+    // synchronously instead.
+    void abortBatch(BatchID batch_id) override;
+
    protected:
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> metadata,
