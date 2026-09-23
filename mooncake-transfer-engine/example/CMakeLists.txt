@@ -183,6 +183,16 @@ if(USE_CNCL AND BUILD_CNCL_TRANSPORT_EXAMPLE)
     PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(cncl_transport_example
                         PRIVATE transfer_engine cnrt glog::glog gflags::gflags)
+
+  # CNCL notifier-exhaustion stress repro: 128 sender threads x ~2k
+  # descriptors per batch against a second local process, mirroring the
+  # production PD-disaggregation load that drains the cnrtNotifier pool.
+  add_executable(cncl_notifier_stress ${WORKSPACE}/cncl_notifier_stress.cpp)
+  target_include_directories(
+    cncl_notifier_stress
+    PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(cncl_notifier_stress
+                        PRIVATE transfer_engine cnrt glog::glog gflags::gflags)
 endif()
 
 # CNCL vs RDMA benchmark for MLU buffers. Same two-process harness for both
